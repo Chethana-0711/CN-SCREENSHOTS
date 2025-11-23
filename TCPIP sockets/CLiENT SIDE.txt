@@ -1,0 +1,115 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <inttypes.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define CHUNK 4096
+
+int send_all(SOCKET s, const void *buf, size_t len) {
+    size_t sent = 0;
+    const char *p = (const char*)buf;
+    while (sent < len) {
+        int n = send(s, p + sent, (int)(len - sent), 0);
+        if (n == SOCKET_ERROR) return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+int recv_all(SOCKET s, void *buf, size_t len) {
+    size_t recvd = 0;
+    char *p = (char*)buf;
+    while (recvd < len) {
+        int n = recv(s, p + recvd, (int)(len - recvd), 0);
+        if (n == 0 || n == SOCKET_ERROR) return -1;
+        recvd += n;
+    }
+    return 0;
+}
+
+uint64_t htonll(uint64_t v) {
+    uint32_t hi = htonl((uint32_t)(v >> 32));
+    uint32_t lo = htonl((uint32_t)(v & 0xFFFFFFFFULL));
+    return (((uint64_t)lo) << 32) | hi;
+}
+uint64_t ntohll(uint64_t v) { return htonll(v); }
+
+int main(int argc, char *argv[]) {
+    printf("Chethana.C (1BM23CS077)\n");
+
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <server-ip> <port> <filename>\n", argv[0]);
+        return 1;
+    }
+
+    const char *server_ip = argv[1];
+    int port = atoi(argv[2]);
+    const char *filename = argv[3];
+    size_t name_len = strlen(filename);
+    if (name_len == 0) { fprintf(stderr, "Empty filename\n"); return 1; }
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) { fprintf(stderr, "socket failed\n"); WSACleanup(); return 1; }
+
+    struct sockaddr_in srv;
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, server_ip, &srv.sin_addr) != 1) { fprintf(stderr, "inet_pton failed\n"); closesocket(sock); WSACleanup(); return 1; }
+
+    if (connect(sock, (struct sockaddr*)&srv, sizeof(srv)) == SOCKET_ERROR) { fprintf(stderr, "connect failed\n"); closesocket(sock); WSACleanup(); return 1; }
+
+    uint32_t name_len_n = htonl((uint32_t)name_len);
+    if (send_all(sock, &name_len_n, sizeof(name_len_n)) < 0) { fprintf(stderr, "send failed\n"); closesocket(sock); WSACleanup(); return 1; }
+    if (send_all(sock, filename, name_len) < 0) { fprintf(stderr, "send failed\n"); closesocket(sock); WSACleanup(); return 1; }
+
+    uint8_t status;
+    if (recv_all(sock, &status, 1) < 0) { fprintf(stderr, "recv failed\n"); closesocket(sock); WSACleanup(); return 1; }
+
+    if (status == 0) {
+        uint32_t elen_n;
+        if (recv_all(sock, &elen_n, sizeof(elen_n)) < 0) { fprintf(stderr, "recv failed\n"); closesocket(sock); WSACleanup(); return 1; }
+        uint32_t elen = ntohl(elen_n);
+        char *errmsg = (char*)malloc(elen + 1);
+        if (!errmsg) { closesocket(sock); WSACleanup(); return 1; }
+        if (recv_all(sock, errmsg, elen) < 0) { free(errmsg); closesocket(sock); WSACleanup(); return 1; }
+        errmsg[elen] = '\0';
+        fprintf(stderr, "Server error: %s\n", errmsg);
+        free(errmsg);
+    } else if (status == 1) {
+        uint64_t fsize_n;
+        if (recv_all(sock, &fsize_n, sizeof(fsize_n)) < 0) { fprintf(stderr, "recv failed\n"); closesocket(sock); WSACleanup(); return 1; }
+        uint64_t fsize = ntohll(fsize_n);
+        printf("Receiving file '%s' (%llu bytes)...\n", filename, (unsigned long long)fsize);
+
+        char outname[1100];
+        snprintf(outname, sizeof(outname), "recv_%s", filename);
+        FILE *out = fopen(outname, "wb");
+        if (!out) { fprintf(stderr, "fopen failed\n"); closesocket(sock); WSACleanup(); return 1; }
+
+        uint64_t remaining = fsize;
+        char buf[CHUNK];
+        while (remaining > 0) {
+            int toread = (int)((remaining > CHUNK) ? CHUNK : (size_t)remaining);
+            if (recv_all(sock, buf, toread) < 0) { fprintf(stderr, "recv failed\n"); fclose(out); closesocket(sock); WSACleanup(); return 1; }
+            fwrite(buf, 1, toread, out);
+            remaining -= toread;
+        }
+        fclose(out);
+        printf("File received and saved as: %s\n", outname);
+    } else {
+        fprintf(stderr, "Unknown status from server: %d\n", status);
+    }
+
+    closesocket(sock);
+    WSACleanup();
+    return 0;
+}
