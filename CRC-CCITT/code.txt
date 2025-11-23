@@ -1,0 +1,51 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#define POLY 0x1021       
+#define INIT_CRC 0xFFFF  
+
+uint16_t compute_crc(uint8_t *data, int len) {
+    uint16_t crc = INIT_CRC;
+
+    for (int i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ POLY;
+            else
+                crc <<= 1;
+        }
+    }
+    return crc & 0xFFFF;
+}
+
+int main() {
+    printf("Chethana.C (1BM23CS077)\n");
+
+    char msg[256];
+    printf("Enter message: ");
+    scanf("%s", msg);
+
+    int len = strlen(msg);
+    uint16_t crc = compute_crc((uint8_t *)msg, len);
+
+    printf("\nOriginal Message: %s", msg);
+    printf("\nCRC-16 (CCITT)   : %04X\n", crc);
+
+    printf("\n--- Receiver Side CRC Check ---\n");
+    char received[300];
+    printf("Enter received message: ");
+    scanf("%s", received);
+
+    uint16_t recv_crc = compute_crc((uint8_t *)received, strlen(received));
+
+    if (recv_crc == 0)
+        printf("NO ERROR: CRC Verified Successfully.\n");
+    else
+        printf("ERROR DETECTED: CRC Mismatch. (Syndrome = %04X)\n", recv_crc);
+
+    return 0;
+}
+
