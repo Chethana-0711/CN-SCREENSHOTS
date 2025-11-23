@@ -1,0 +1,149 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib,"ws2_32.lib")
+
+#define CHUNK 1024
+#define MAX_FILENAME 1024
+#define RETRANS_MAX 8
+#define ACK_TIMEOUT_MS 1000
+
+int send_packet_and_wait_ack(SOCKET s, struct sockaddr_in *cli, socklen_t clin, uint32_t seq,
+                             uint8_t last, const char *data, int data_len) {
+   
+    uint32_t seq_n = htonl(seq);
+    char packet[5 + CHUNK];
+    memcpy(packet, &seq_n, 4);
+    packet[4] = (char)last;
+    if (data_len > 0) memcpy(packet + 5, data, data_len);
+    int pkt_len = 5 + data_len;
+
+    int attempts = 0;
+    while (attempts < RETRANS_MAX) {
+        // send
+        int sent = sendto(s, packet, pkt_len, 0, (struct sockaddr*)cli, clin);
+        if (sent == SOCKET_ERROR) return -1;
+
+        
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(s, &readfds);
+        struct timeval tv;
+        tv.tv_sec = ACK_TIMEOUT_MS / 1000;
+        tv.tv_usec = (ACK_TIMEOUT_MS % 1000) * 1000;
+
+        int rv = select(0, &readfds, NULL, NULL, &tv);
+        if (rv > 0 && FD_ISSET(s, &readfds)) {
+            
+            char ackbuf[4];
+            struct sockaddr_in from;
+            int fromlen = sizeof(from);
+            int r = recvfrom(s, ackbuf, 4, 0, (struct sockaddr*)&from, &fromlen);
+            if (r == 4) {
+                uint32_t ack_n;
+                memcpy(&ack_n, ackbuf, 4);
+                uint32_t ack = ntohl(ack_n);
+                if (ack == seq) return 0; // success
+               
+            }
+        }
+   
+        attempts++;
+    }
+    return -2; 
+}
+
+int main(int argc, char *argv[]) {
+    printf("Chethana.C (1BM23CS077)\n");
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+    int port = atoi(argv[1]);
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { fprintf(stderr, "socket failed\n"); WSACleanup(); return 1; }
+
+    struct sockaddr_in sa;
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    sa.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        fprintf(stderr, "bind failed\n"); closesocket(s); WSACleanup(); return 1;
+    }
+
+    printf("UDP server listening on port %d\n", port);
+
+    for (;;) {
+        char buf[1500];
+        struct sockaddr_in cli;
+        int clin = sizeof(cli);
+
+        int r = recvfrom(s, buf, sizeof(buf)-1, 0, (struct sockaddr*)&cli, &clin);
+        if (r <= 0) continue;
+        buf[r] = '\0';
+        printf("Request from %s:%d -> filename: '%s'\n", inet_ntoa(cli.sin_addr), ntohs(cli.sin_port), buf);
+
+      
+        FILE *f = fopen(buf, "rb");
+        if (!f) {
+            
+            uint32_t errseq_n = htonl(0xFFFFFFFFu);
+            char errmsg[512];
+            snprintf(errmsg, sizeof(errmsg), "NOTFOUND");
+            char pkt[4 + 1 + 512];
+            memcpy(pkt, &errseq_n, 4);
+            pkt[4] = 0; // last flag ignored
+            int pktlen = 5 + (int)strlen(errmsg);
+            memcpy(pkt + 5, errmsg, strlen(errmsg));
+            sendto(s, pkt, pktlen, 0, (struct sockaddr*)&cli, clin);
+            printf("File '%s' not found -> sent NOTFOUND\n", buf);
+            continue;
+        }
+
+       
+        fseek(f, 0, SEEK_END);
+        long long fsize_ll = _ftelli64(f);
+        fseek(f, 0, SEEK_SET);
+        uint64_t fsize = (fsize_ll < 0) ? 0 : (uint64_t)fsize_ll;
+        printf("Sending file size: %llu bytes\n", (unsigned long long)fsize);
+
+       
+
+        uint32_t seq = 0;
+        char chunk[CHUNK];
+        size_t got;
+        while ((got = fread(chunk, 1, CHUNK, f)) > 0) {
+            uint8_t last = (feof(f) ? 1 : 0);
+            int res = send_packet_and_wait_ack(s, &cli, clin, seq, last, chunk, (int)got);
+            if (res == 0) {
+                // sent & acked
+                seq++;
+            } else if (res == -2) {
+                fprintf(stderr, "Failed to get ACK for seq %u after retries; aborting transfer\n", seq);
+                break;
+            } else {
+                fprintf(stderr, "Socket error while sending seq %u\n", seq);
+                break;
+            }
+        }
+        fclose(f);
+        printf("Finished transfer (or aborted). Last seq sent: %u\n", seq ? seq-1 : 0);
+    }
+
+    closesocket(s);
+    WSACleanup();
+    return 0;
+}

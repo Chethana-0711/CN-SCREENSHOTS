@@ -1,0 +1,107 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib,"ws2_32.lib")
+
+#define CHUNK 1024
+#define TIMEOUT_MS 5000
+
+int main(int argc, char *argv[]) {
+    printf("Chethana.C (1BM23CS077)\n");
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <server-ip> <port> <filename>\n", argv[0]);
+        return 1;
+    }
+    const char *server_ip = argv[1];
+    int port = atoi(argv[2]);
+    const char *filename = argv[3];
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { fprintf(stderr, "socket failed\n"); WSACleanup(); return 1; }
+
+    struct sockaddr_in srv;
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, server_ip, &srv.sin_addr) != 1) { fprintf(stderr, "inet_pton failed\n"); closesocket(s); WSACleanup(); return 1; }
+
+    
+    int sent = sendto(s, filename, (int)strlen(filename), 0, (struct sockaddr*)&srv, sizeof(srv));
+    if (sent == SOCKET_ERROR) { fprintf(stderr, "sendto failed\n"); closesocket(s); WSACleanup(); return 1; }
+
+    
+    char outname[1100];
+    snprintf(outname, sizeof(outname), "recv_%s", filename);
+    FILE *out = fopen(outname, "wb");
+    if (!out) { perror("fopen"); closesocket(s); WSACleanup(); return 1; }
+
+    
+    struct timeval tv;
+    tv.tv_sec = TIMEOUT_MS / 1000;
+    tv.tv_usec = (TIMEOUT_MS % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    uint32_t expected_seq = 0;
+    int finished = 0;
+    while (!finished) {
+        char pkt[5 + CHUNK];
+        struct sockaddr_in from;
+        int fromlen = sizeof(from);
+        int r = recvfrom(s, pkt, sizeof(pkt), 0, (struct sockaddr*)&from, &fromlen);
+        if (r == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT) {
+                fprintf(stderr, "Timed out waiting for server response\n");
+            } else {
+                fprintf(stderr, "recvfrom error: %d\n", err);
+            }
+            break;
+        }
+        if (r < 5) continue; 
+
+   
+        uint32_t seq_n;
+        memcpy(&seq_n, pkt, 4);
+        uint32_t seq = ntohl(seq_n);
+        uint8_t last = (uint8_t)pkt[4];
+        int payload_len = r - 5;
+
+        
+        if (seq == 0xFFFFFFFFu) {
+            
+            pkt[5 + payload_len] = '\0';
+            fprintf(stderr, "Server error: %.*s\n", payload_len, pkt + 5);
+            break;
+        }
+
+        
+        if (seq == expected_seq) {
+            if (payload_len > 0) fwrite(pkt + 5, 1, payload_len, out);
+            
+            uint32_t ack_n = htonl(seq);
+            sendto(s, (const char*)&ack_n, 4, 0, (struct sockaddr*)&from, fromlen);
+            expected_seq++;
+            if (last) {
+                printf("Received final packet seq %u; total bytes written in recv_%s\n", seq, filename);
+                finished = 1;
+                break;
+            }
+        } else {
+       
+            uint32_t ack_n = htonl((expected_seq == 0) ? 0xFFFFFFFFu : expected_seq - 1);
+            sendto(s, (const char*)&ack_n, 4, 0, (struct sockaddr*)&from, fromlen);
+        }
+    }
+
+    fclose(out);
+    closesocket(s);
+    WSACleanup();
+    return 0;
+}
